@@ -30,6 +30,14 @@ _SYSTEM = (
     "information in the corpus to answer — do not invent facts."
 )
 
+_GREETING_TERMS = {"hello", "hey", "hi", "hola", "yo"}
+_THANKS_TERMS = {"thank", "thanks", "ty"}
+_HELP_QUERIES = {
+    "help",
+    "what can you do",
+    "who are you",
+}
+
 
 class ChatState(TypedDict, total=False):
     question: str
@@ -55,6 +63,7 @@ def _format_context(docs: list[Document]) -> tuple[str, list[dict]]:
                 "book": m.get("book"),
                 "page": m.get("page"),
                 "section": m.get("section"),
+                "snippet": d.page_content[:500],
             }
         )
     return "\n\n".join(lines), sources
@@ -64,6 +73,33 @@ def _parse_indices(text: str, n: int) -> list[int]:
     if "NONE" in text.upper():
         return []
     return sorted({int(x) for x in re.findall(r"\d+", text) if 0 <= int(x) < n})
+
+
+def _small_talk_answer(question: str) -> str | None:
+    """Answer simple non-corpus turns without paying retrieval/LLM latency."""
+
+    normalized = re.sub(r"[^a-z0-9\s]", " ", question.lower())
+    words = [word for word in normalized.split() if word]
+    phrase = " ".join(words)
+    if not words:
+        return None
+
+    if phrase in _HELP_QUERIES:
+        return (
+            "I can answer questions grounded in your uploaded PDFs. Upload a PDF in the "
+            "sidebar, click `Save + ingest`, then ask about the document."
+        )
+
+    if len(words) <= 3 and any(word in _GREETING_TERMS for word in words):
+        return (
+            "Hey, I am ready. Upload or ingest a PDF, then ask me a question about "
+            "the corpus."
+        )
+
+    if len(words) <= 4 and any(word in _THANKS_TERMS for word in words):
+        return "You got it. Ask me anything from the uploaded corpus."
+
+    return None
 
 
 def build_chat_graph(
@@ -163,6 +199,9 @@ def build_chat_graph(
 
 def answer(graph, question: str) -> dict:
     """Run the graph for a single question; return {generation, sources, documents}."""
+    if response := _small_talk_answer(question):
+        return {"generation": response, "sources": [], "documents": []}
+
     state = graph.invoke(
         {"question": question, "original_question": question, "retries": 0}
     )
@@ -171,3 +210,55 @@ def answer(graph, question: str) -> dict:
         "sources": state.get("sources", []),
         "documents": state.get("documents", []),
     }
+
+
+def stream_answer(question, *, settings=None, llm=None, retriever=None):
+    """Stream a chat turn for a live-typing UX.
+
+    Yields ``("sources", list[dict])`` exactly once, then ``("token", str)``
+    repeatedly. Reuses the small-talk shortcut, system prompt, and context
+    formatter used by :func:`build_chat_graph`, but streams the final answer via
+    LCEL ``.stream()`` instead of a single ``invoke``. ``llm``/``retriever`` are
+    injectable for testing with fakes.
+    """
+    if response := _small_talk_answer(question):
+        yield ("sources", [])
+        yield ("token", response)
+        return
+
+    settings = settings or get_settings()
+    if llm is None:
+        from raggym.llm import get_llm
+
+        llm = get_llm(settings)
+
+    owns_retriever = False
+    if retriever is None:
+        from raggym.retrieval import RagRetriever
+
+        retriever = RagRetriever(settings, llm=llm)
+        owns_retriever = True
+    try:
+        docs = retriever.retrieve(question)
+    finally:
+        if owns_retriever:
+            retriever.close()  # free the local Qdrant lock before the LLM stream
+
+    context, sources = _format_context(docs)
+    if not docs:
+        context = "(no relevant passages found)"
+    yield ("sources", sources)
+
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+
+    chain = (
+        ChatPromptTemplate.from_messages(
+            [("system", _SYSTEM), ("human", "Question: {question}\n\nContext:\n{context}")]
+        )
+        | llm
+        | StrOutputParser()
+    )
+    for chunk in chain.stream({"question": question, "context": context}):
+        if chunk:
+            yield ("token", chunk)
